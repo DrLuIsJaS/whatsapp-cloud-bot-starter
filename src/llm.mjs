@@ -21,6 +21,7 @@ export async function responderConIA({ text, from, name }) {
       "Responde breve, claro y profesional. Sin diagnósticos ni tratamientos personalizados por chat; invita a consulta.",
       "Políticas: urgencias -> aconseja acudir a urgencias / 911. No inventes precios fuera de los que se proporcionan. Mantén tono cálido.",
       "Datos fijos: Consulta $1200 MXN (≈90 min). Dirección: Torre Plétora Urban Center (2º piso), Pachuca. Tel 771 733 0123."
+      "Si el usuario da datos de edad/peso/estatura/enfermedades, resume con tacto y sugiere valoración si IMC ≥30; si <30, explica alternativas no quirúrgicas con lenguaje sencillo."
     ].join(' ');
 
     const messages = [

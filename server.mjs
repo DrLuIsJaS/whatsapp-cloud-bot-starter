@@ -5,6 +5,7 @@ import fetch from 'node-fetch';
 import { responderConIA } from './src/llm.mjs';
 import { listFreeSlots, createTentativeEvent } from './src/calendar.mjs';
 import { createClient } from '@supabase/supabase-js';
+import { extractPatientData } from './src/extract.mjs';
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf)=>{ req.rawBody = buf } }));
@@ -81,6 +82,7 @@ app.post('/webhook', async (req,res)=>{
 
     await logMsg({ wa_id: from, name, direction:'in', body: text });
 
+    // Urgencias
     if (/(urgencia|emergencia|sangrado|dolor intenso|fiebre alta)/i.test(text)){
       await sendText(from, "Si es una urgencia, por favor acude a urgencias o llama al 911.");
       return res.sendStatus(200);
@@ -89,15 +91,18 @@ app.post('/webhook', async (req,res)=>{
     let out = null;
     const i = intent(text);
 
+    // Config agenda
     const tz = env.CALENDAR_TIMEZONE || 'America/Mexico_City';
     const slotMinutes = +(env.CALENDAR_SLOT_MINUTES||30);
     const workStart = env.CALENDAR_WORK_START || '09:00';
     const workEnd = env.CALENDAR_WORK_END || '18:00';
     const lookDays = +(env.CALENDAR_LOOKAHEAD_DAYS||14);
 
+    // Sesión por contacto
     const s = sesiones.get(from) || { flujo:null, paso:0, datos:{} };
     function reset(){ s.flujo=null; s.paso=0; s.datos={}; sesiones.set(from, s); }
 
+    // Ramas directas
     if (i==='ubicacion'){
       out = "Estamos en **GBC Gastro Bariatric Center**, Torre Plétora Urban Center (2º piso), Pachuca.";
     } else if (i==='precios'){
@@ -108,32 +113,60 @@ app.post('/webhook', async (req,res)=>{
       out = "Atendemos vesícula, hernias (inguinal/umbilical/hiato), reflujo, acalasia, gastritis y colitis. ¿Deseas agendar **valoración** ($1200 MXN, 90 min)?";
       s.flujo='cita'; s.paso=0; sesiones.set(from, s);
     } else if (i==='bariatria'){
+      // Inicia triage bariátrico flexible (texto libre)
       s.flujo='bariatria'; s.paso=0; sesiones.set(from, s);
-      out = "Para orientarte mejor, ¿me compartes **edad**, **peso (kg)**, **estatura (cm)** y enfermedades si aplica?";
+      out = "Perfecto. Para orientarte mejor, cuéntame en tus palabras: **edad**, **peso** y **estatura** (como gustes), y si tienes alguna **enfermedad** (diabetes, hipertensión, etc.).";
     } else if (i==='cita'){
       s.flujo='cita'; s.paso=0; sesiones.set(from, s);
       out = "Perfecto. ¿Cuál es tu **nombre completo** para agendar?";
     } else if (i==='humano'){
       out = "Con gusto te comunico con un asesor humano. ¿Prefieres mensaje por WhatsApp o llamada?";
-    } else if (s.flujo==='bariatria'){
+    } 
+    // === Flujo Bariatría (extractor inteligente) ===
+    else if (s.flujo==='bariatria'){
       if (s.paso===0){
-        s.datos.raw = text; s.paso=1; sesiones.set(from, s);
-        out = "Gracias. Confírmame en *este formato*: edad (años), peso (kg), estatura (cm) y enfermedades (si aplica).";
-      } else if (s.paso===1){
-        const edad = +(text.match(/([0-9]{2})/)?.[1] || 0);
-        const nums = (text.match(/([0-9]{2,3})/g) || []).map(n=>+n);
-        let peso = nums[0]||0, est = nums[1]||0;
-        const imc = (peso && est) ? +(peso / ((est/100)**2)).toFixed(1) : null;
-        s.datos={ edad, peso, estatura:est, imc }; s.paso=2; sesiones.set(from, s);
-        if (!imc) out = "No pude calcular tu IMC. ¿Me confirmas peso en kg y estatura en cm?";
-        else if (imc>=30){
-          out = `Tu **IMC es ${imc}**. Con IMC ≥30, eres **candidato potencial** a cirugía bariátrica. Requerimos **protocolo prequirúrgico** con valoración del equipo multidisciplinario para definir el procedimiento ideal. ¿Deseas **agendar valoración** ($1200 MXN, 90 min)?`;
-          s.flujo='cita'; s.paso=0; sesiones.set(from, s);
+        s.paso = 1; sesiones.set(from, s);
+        out = "Perfecto. Para orientarte mejor, cuéntame en tus palabras: **edad**, **peso** y **estatura** (como gustes), y si tienes alguna **enfermedad** (diabetes, hipertensión, etc.).";
+      } else {
+        // Extrae datos de texto libre con OpenAI+regex (si hay IA) o solo regex
+        const prev = s.datos || {};
+        const ex = await extractPatientData(text);
+        s.datos = {
+          edad: prev.edad ?? ex.age ?? null,
+          peso: prev.peso ?? ex.weight_kg ?? null,
+          estatura: prev.estatura ?? ex.height_cm ?? null,
+          enfermedades: Array.isArray(prev.enfermedades) && prev.enfermedades.length ? prev.enfermedades : (ex.diseases || [])
+        };
+        sesiones.set(from, s);
+
+        const faltan = [];
+        if (!s.datos.edad) faltan.push('edad');
+        if (!s.datos.peso) faltan.push('peso');
+        if (!s.datos.estatura) faltan.push('estatura');
+
+        if (faltan.length){
+          const p = faltan.join(', ').replace(/, ([^,]*)$/, ' y $1');
+          out = `Gracias. Me falta **${p}**. Puedes decirlo como quieras (ej. "tengo 38, peso 112 kg y mido 1.68").`;
         } else {
-          out = `Tu **IMC es ${imc}**. Con IMC <30, opciones como **balón** o **medicamentos** ayudan cuando hay 10–15 kg sobre el ideal, pero **no tienen la potencia** de la cirugía para normalizar peso. ¿Deseas info de manejo no quirúrgico o prefieres valoración?`;
+          const imc = bmi(s.datos.peso, s.datos.estatura);
+          s.datos.imc = imc;
+          if (imc && imc >= 30){
+            out = `Tu **IMC es ${imc}**. Con IMC ≥30, **sí podrías ser candidato** a cirugía bariátrica.\n` +
+                  `Seguimos un **protocolo prequirúrgico** con valoración del equipo multidisciplinario para definir el mejor procedimiento.\n` +
+                  `¿Deseas **agendar una valoración** ($1200 MXN, ~90 min) para resolver dudas y planear tu tratamiento?`;
+            // Saltamos a flujo de cita
+            s.flujo='cita'; s.paso=0; sesiones.set(from, s);
+          } else if (imc) {
+            out = `Tu **IMC es ${imc}**. Con IMC <30, opciones como **balón** o **medicamentos** ayudan cuando hay ~10–15 kg sobre el ideal, pero **no tienen la potencia** de la cirugía para normalizar peso.\n` +
+                  `Si lo deseas, podemos ver manejo no quirúrgico o **agendar valoración** para revisar tu caso.`;
+          } else {
+            out = "No pude calcular tu IMC. ¿Me confirmas peso en kg y estatura en cm o en metros? (Ej. 112 kg y 1.68 m)";
+          }
         }
       }
-    } else if (s.flujo==='cita'){
+    } 
+    // === Flujo Citas (Google Calendar) ===
+    else if (s.flujo==='cita'){
       if (s.paso===0){
         s.datos.nombre = text.trim();
         s.paso=1; sesiones.set(from, s);
@@ -168,11 +201,14 @@ app.post('/webhook', async (req,res)=>{
       }
     }
 
+    // Minifaq por keywords si no hubo respuesta aún
     if (!out){
       const t = (text||'').toLowerCase();
       if (/manga|sleeve/.test(t)) out = "La **manga gástrica** reduce el tamaño del estómago; requiere evaluación integral. ¿Deseas agendar valoración ($1200 MXN, 90 min)?";
       else if (/bypass/.test(t)) out = "El **bypass gástrico** favorece pérdida de peso y control metabólico. ¿Agendamos valoración?";
     }
+
+    // IA como último recurso
     if (!out) out = await responderConIA({ text, from, name });
 
     await sendText(from, out);
