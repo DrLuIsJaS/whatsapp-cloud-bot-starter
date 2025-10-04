@@ -6,6 +6,7 @@ import { responderConIA } from './src/llm.mjs';
 import { listFreeSlots, createTentativeEvent } from './src/calendar.mjs';
 import { createClient } from '@supabase/supabase-js';
 import { extractPatientData } from './src/extract.mjs';
+import { think } from './src/brain.mjs';
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf)=>{ req.rawBody = buf } }));
@@ -82,114 +83,88 @@ app.post('/webhook', async (req,res)=>{
 
     await logMsg({ wa_id: from, name, direction:'in', body: text });
 
-    // Urgencias
+    // Reglas duras inmediatas
     if (/(urgencia|emergencia|sangrado|dolor intenso|fiebre alta)/i.test(text)){
       await sendText(from, "Si es una urgencia, por favor acude a urgencias o llama al 911.");
       return res.sendStatus(200);
     }
+    if (/(cpre|endoscop|diarrea cr[oó]nica)/i.test(text)){
+      await sendText(from, "No realizamos CPRE, endoscopias ni manejo de diarrea crónica; podemos orientarte con un centro especializado.");
+      return res.sendStatus(200);
+    }
 
-    let out = null;
-    const i = intent(text);
+    // === IA-FIRST: pedimos a OpenAI que genere respuesta + intent + entidades ===
+    const brain = await think({ text, name, phone: from });
 
-    // Config agenda
+    // Estado por usuario (para slots/confirmación)
+    const s = sesiones.get(from) || { flujo:null, paso:0, datos:{} };
     const tz = env.CALENDAR_TIMEZONE || 'America/Mexico_City';
     const slotMinutes = +(env.CALENDAR_SLOT_MINUTES||30);
     const workStart = env.CALENDAR_WORK_START || '09:00';
     const workEnd = env.CALENDAR_WORK_END || '18:00';
     const lookDays = +(env.CALENDAR_LOOKAHEAD_DAYS||14);
-
-    // Sesión por contacto
-    const s = sesiones.get(from) || { flujo:null, paso:0, datos:{} };
     function reset(){ s.flujo=null; s.paso=0; s.datos={}; sesiones.set(from, s); }
 
-    // Ramas directas
-    if (i==='ubicacion'){
-      out = "Estamos en **GBC Gastro Bariatric Center**, Torre Plétora Urban Center (2º piso), Pachuca.";
-    } else if (i==='precios'){
-      out = "Consulta de valoración: **$1200 MXN** (~90 min). Cirugía depende del procedimiento: **manga desde $70,000** y **bypass desde $85,000**. Se confirma en consulta.";
-    } else if (i==='no-servicio'){
-      out = "No realizamos **CPRE, endoscopias** ni manejo de **diarrea crónica**. Podemos orientarte con un centro especializado.";
-    } else if (i==='gi'){
-      out = "Atendemos vesícula, hernias (inguinal/umbilical/hiato), reflujo, acalasia, gastritis y colitis. ¿Deseas agendar **valoración** ($1200 MXN, 90 min)?";
-      s.flujo='cita'; s.paso=0; sesiones.set(from, s);
-    } else if (i==='bariatria'){
-      // Inicia triage bariátrico flexible (texto libre)
-      s.flujo='bariatria'; s.paso=0; sesiones.set(from, s);
-      out = "Perfecto. Para orientarte mejor, cuéntame en tus palabras: **edad**, **peso** y **estatura** (como gustes), y si tienes alguna **enfermedad** (diabetes, hipertensión, etc.).";
-    } else if (i==='cita'){
-      s.flujo='cita'; s.paso=0; sesiones.set(from, s);
-      out = "Perfecto. ¿Cuál es tu **nombre completo** para agendar?";
-    } else if (i==='humano'){
-      out = "Con gusto te comunico con un asesor humano. ¿Prefieres mensaje por WhatsApp o llamada?";
-    } 
-    // === Flujo Bariatría (extractor inteligente) ===
-    else if (s.flujo==='bariatria'){
-      if (s.paso===0){
-        s.paso = 1; sesiones.set(from, s);
-        out = "Perfecto. Para orientarte mejor, cuéntame en tus palabras: **edad**, **peso** y **estatura** (como gustes), y si tienes alguna **enfermedad** (diabetes, hipertensión, etc.).";
-      } else {
-        // Extrae datos de texto libre con OpenAI+regex (si hay IA) o solo regex
-        const prev = s.datos || {};
-        const ex = await extractPatientData(text);
-        s.datos = {
-          edad: prev.edad ?? ex.age ?? null,
-          peso: prev.peso ?? ex.weight_kg ?? null,
-          estatura: prev.estatura ?? ex.height_cm ?? null,
-          enfermedades: Array.isArray(prev.enfermedades) && prev.enfermedades.length ? prev.enfermedades : (ex.diseases || [])
-        };
-        sesiones.set(from, s);
+    let out = brain.reply;
 
-        const faltan = [];
-        if (!s.datos.edad) faltan.push('edad');
-        if (!s.datos.peso) faltan.push('peso');
-        if (!s.datos.estatura) faltan.push('estatura');
+    // TRIAGE: si hay datos, calculamos IMC y ajustamos mensaje (sin perder el tono IA)
+    const hasTriage = brain.intent === 'bariatric_triage' || brain.entities?.weight_kg || brain.entities?.height_cm || brain.entities?.age;
+    if (hasTriage) {
+      const peso = brain.entities?.weight_kg || s.datos.peso || null;
+      const est = brain.entities?.height_cm || s.datos.estatura || null;
+      if (peso && est) {
+        const h = est/100;
+        const imc = +(peso / (h*h)).toFixed(1);
+        s.datos.peso = peso; s.datos.estatura = est; s.datos.imc = imc; sesiones.set(from, s);
 
-        if (faltan.length){
-          const p = faltan.join(', ').replace(/, ([^,]*)$/, ' y $1');
-          out = `Gracias. Me falta **${p}**. Puedes decirlo como quieras (ej. "tengo 38, peso 112 kg y mido 1.68").`;
+        if (imc >= 30) {
+          out += `\n\nTu **IMC es ${imc}**. Con IMC ≥30, podrías ser **candidato** a cirugía bariátrica. Requerimos un **protocolo prequirúrgico** (equipo multidisciplinario) para elegir el procedimiento ideal. ¿Deseas **agendar valoración** ($1200, ~90 min)?`;
+          brain.want_appointment = true; // empuja al flujo de cita
         } else {
-          const imc = bmi(s.datos.peso, s.datos.estatura);
-          s.datos.imc = imc;
-          if (imc && imc >= 30){
-            out = `Tu **IMC es ${imc}**. Con IMC ≥30, **sí podrías ser candidato** a cirugía bariátrica.\n` +
-                  `Seguimos un **protocolo prequirúrgico** con valoración del equipo multidisciplinario para definir el mejor procedimiento.\n` +
-                  `¿Deseas **agendar una valoración** ($1200 MXN, ~90 min) para resolver dudas y planear tu tratamiento?`;
-            // Saltamos a flujo de cita
-            s.flujo='cita'; s.paso=0; sesiones.set(from, s);
-          } else if (imc) {
-            out = `Tu **IMC es ${imc}**. Con IMC <30, opciones como **balón** o **medicamentos** ayudan cuando hay ~10–15 kg sobre el ideal, pero **no tienen la potencia** de la cirugía para normalizar peso.\n` +
-                  `Si lo deseas, podemos ver manejo no quirúrgico o **agendar valoración** para revisar tu caso.`;
-          } else {
-            out = "No pude calcular tu IMC. ¿Me confirmas peso en kg y estatura en cm o en metros? (Ej. 112 kg y 1.68 m)";
-          }
+          out += `\n\nTu **IMC es ${imc}**. Con IMC <30, el **balón** o **medicamentos** ayudan cuando hay ~10–15 kg sobre el ideal, pero **no tienen la potencia** de la cirugía. Si gustas, podemos ver manejo no quirúrgico o agendar valoración.`;
+        }
+      } else {
+        // pide lo que falta de forma amable (dejamos que la IA lo haya hecho; reforzamos por si acaso)
+        const faltan = [];
+        if (!peso) faltan.push('peso (kg)');
+        if (!est) faltan.push('estatura (cm o en metros)');
+        if (faltan.length) {
+          out += `\n\n¿Me confirmas ${faltan.join(' y ')}? Puedes decirlo libremente (ej. “peso 112 y mido 1.68”).`;
         }
       }
-    } 
-    // === Flujo Citas (Google Calendar) ===
-    else if (s.flujo==='cita'){
-      if (s.paso===0){
-        s.datos.nombre = text.trim();
-        s.paso=1; sesiones.set(from, s);
+    }
+
+    // CITA: si la IA detecta intención o el usuario lo pide, sacamos slots y confirmamos
+    if (brain.intent === 'book_appointment' || brain.want_appointment) {
+      if (s.paso === 0) {
+        s.flujo='cita'; s.paso=1; sesiones.set(from, s);
         const slots = await listFreeSlots({ days: parseInt(lookDays), tz, slotMinutes, workStart, workEnd }).catch(()=>[]);
-        if (!slots.length) out = "No encuentro horarios libres en las próximas semanas. ¿Propones fecha/hora y te confirmamos?";
-        else {
-          s.datos.slots = slots;
+        if (!slots.length) {
+          out += `\n\nAhora mismo no encuentro horarios libres en los próximos días. ¿Deseas proponer fecha/hora y te confirmamos?`;
+        } else {
+          s.datos.slots = slots; sesiones.set(from, s);
           const lista = slots.map((x,i)=>`${i+1}) ${x.label}`).join('\n');
-          out = "Horarios disponibles (responde con el número):\n"+lista;
+          out += `\n\n**Horarios disponibles** (responde con el número):\n${lista}`;
         }
-      } else if (s.paso===1){
-        const idx = parseInt(text.trim())-1;
-        const slots = s.datos.slots||[];
-        if (isNaN(idx)||idx<0||idx>=slots.length) out = "Responde con el **número** del horario elegido.";
-        else { s.datos.elegido = slots[idx]; s.paso=2; sesiones.set(from, s); out = `¿Confirmas tu cita para **${slots[idx].label}**? (sí/no)`; }
-      } else if (s.paso===2){
-        if (/^s[ií]/i.test(text)){
+      } else if (s.paso === 1) {
+        // Si la IA ya eligió un índice, úsalo; si no, intenta parsear del texto
+        const idx = (Number.isInteger(brain.slot_choice_index) ? brain.slot_choice_index : (parseInt(text.trim())-1));
+        const slots = s.datos.slots || [];
+        if (isNaN(idx) || idx<0 || idx>=slots.length) {
+          out = `Por favor responde con el **número** del horario elegido.`;
+        } else {
+          s.datos.elegido = slots[idx]; s.paso=2; sesiones.set(from, s);
+          out = `¿Confirmas tu cita para **${slots[idx].label}**? (sí/no)`;
+        }
+      } else if (s.paso === 2) {
+        const confirm = brain.confirm_appointment || (/^s[ií]/i.test(text) ? 'yes' : /^n(o)?/i.test(text) ? 'no' : null);
+        if (confirm === 'yes') {
           try{
             await createTentativeEvent({
               startISO: s.datos.elegido.iso,
               minutes: slotMinutes,
-              summary: `Valoración GBC - ${s.datos.nombre}`,
-              description: `Cita solicitada por WhatsApp. Paciente: ${s.datos.nombre}.`
+              summary: `Valoración GBC - ${s.datos.nombre || name || from}`,
+              description: `Cita solicitada por WhatsApp. Paciente: ${s.datos.nombre || name || from}.`
             });
             out = "¡Listo! Dejé tu cita en **tentativa**. Te confirmamos por este medio.";
           }catch(e){
@@ -197,20 +172,22 @@ app.post('/webhook', async (req,res)=>{
             out = "No pude registrar la cita ahora mismo. ¿Te contactamos para confirmarla?";
           }
           reset();
-        } else { reset(); out = "Sin problema. ¿Quieres ver otros horarios o que te contactemos?"; }
+        } else if (confirm === 'no') {
+          reset();
+          out = "Sin problema. ¿Quieres ver otros horarios o que te contactemos?";
+        } else {
+          out = "¿Me confirmas por favor si **sí** o **no**?";
+        }
       }
     }
 
-    // Minifaq por keywords si no hubo respuesta aún
-    if (!out){
-      const t = (text||'').toLowerCase();
-      if (/manga|sleeve/.test(t)) out = "La **manga gástrica** reduce el tamaño del estómago; requiere evaluación integral. ¿Deseas agendar valoración ($1200 MXN, 90 min)?";
-      else if (/bypass/.test(t)) out = "El **bypass gástrico** favorece pérdida de peso y control metabólico. ¿Agendamos valoración?";
+    // Si el usuario dijo antes su nombre durante la cita, guarda
+    if (s.flujo==='cita' && s.paso===1 && !s.datos.nombre) {
+      // intenta capturar un nombre del mensaje con IA ya que todo es IA-first
+      s.datos.nombre = name || null; sesiones.set(from, s);
     }
 
-    // IA como último recurso
-    if (!out) out = await responderConIA({ text, from, name });
-
+    // Enviar y log
     await sendText(from, out);
     await logMsg({ wa_id: from, name, direction:'out', body: out });
     return res.sendStatus(200);
@@ -219,6 +196,7 @@ app.post('/webhook', async (req,res)=>{
     return res.sendStatus(200);
   }
 });
+
 
 async function sendText(to, body){
   const url = `https://graph.facebook.com/v23.0/${process.env.PHONE_NUMBER_ID}/messages`;
